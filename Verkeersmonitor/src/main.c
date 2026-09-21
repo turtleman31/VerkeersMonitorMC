@@ -4,7 +4,9 @@
 #include <stdint.h>
 
 #define HOSE1_MASK          (1 << PD2)
+#define HOSE2_MASK          (1 << PD3)
 #define COUNT_LED_MASK      ((1 << PC0) | (1 << PC1) | (1 << PC2) | (1 << PC3))
+#define ERROR_LED_MASK      (1 << PC5)
 #define SEGMENT_AF_MASK     ((1 << PB0) | (1 << PB1) | (1 << PB2) | (1 << PB3) | (1 << PB4) | (1 << PB5))
 #define SEGMENT_G_MASK      (1 << PC4)
 #define DECIMAL_POINT_MASK  (1 << PD4)
@@ -16,6 +18,16 @@
 #define MULTIPLEX_MS         2
 #define DIGIT_COUNT          3
 #define UNITS_DIGIT          1
+#define TENTHS_PER_UNIT      10
+#define DECIMAL_BASE         10
+
+#define HOSE_DISTANCE_MM      600
+#define SPEED_MIN_KMH_X10     2
+#define SPEED_MAX_KMH_X10     100
+#define KMH_X10_PER_MM_PER_MS 36 // 1 mm/ms is 3.6 km/h
+#define TRAVEL_MS(kmh_x10)    (HOSE_DISTANCE_MM * KMH_X10_PER_MM_PER_MS / (kmh_x10))
+#define SPEED_TIMEOUT_MS      TRAVEL_MS(SPEED_MIN_KMH_X10)
+#define SPEED_MIN_TRAVEL_MS   TRAVEL_MS(SPEED_MAX_KMH_X10)
 
 #define SEG_A (1 << 0)
 #define SEG_B (1 << 1)
@@ -39,7 +51,7 @@ static const uint8_t DIGIT_PATTERNS[] =
     SEG_A | SEG_B | SEG_C | SEG_D | SEG_F | SEG_G,
 };
 static const uint8_t  DIGIT_PINS[DIGIT_COUNT]     = { 1 << PD5, 1 << PD6, 1 << PD7 };
-static const uint16_t DIGIT_DIVISORS[DIGIT_COUNT] = { 100, 10, 1 };
+static const uint16_t DIGIT_DIVISORS[DIGIT_COUNT] = { DECIMAL_BASE * DECIMAL_BASE, DECIMAL_BASE, 1 };
 
 typedef struct
 {
@@ -59,11 +71,11 @@ typedef struct
 
 static void initialize_io(void)
 {
-    DDRD &= ~HOSE1_MASK;
-    PORTD |= HOSE1_MASK; // pull-up, so pressed reads low
+    DDRD &= ~(HOSE1_MASK | HOSE2_MASK);
+    PORTD |= HOSE1_MASK | HOSE2_MASK; // pull-up, so pressed reads low
 
-    DDRC |= COUNT_LED_MASK;
-    PORTC &= ~COUNT_LED_MASK;
+    DDRC |= COUNT_LED_MASK | ERROR_LED_MASK;
+    PORTC &= ~(COUNT_LED_MASK | ERROR_LED_MASK);
 
     DDRB |= SEGMENT_AF_MASK;
     DDRC |= SEGMENT_G_MASK;
@@ -125,10 +137,65 @@ static void display_counter(uint8_t count)
     PORTC = (PORTC & ~COUNT_LED_MASK) | (count & COUNT_LED_MASK);
 }
 
+static void set_error_led(bool on)
+{
+    PORTC = (PORTC & ~ERROR_LED_MASK) | (on ? ERROR_LED_MASK : 0);
+}
+
 static void display_speed(display_t *display, uint16_t speed_x10)
 {
     display->value = speed_x10;
     display->blank = false;
+}
+
+static void display_clear(display_t *display)
+{
+    display->blank = true;
+}
+
+// hose 1 starts the clock, hose 2 stops it, anything else lights the red led
+static void measure_speed(bool axle_hose1, bool axle_hose2, uint32_t now_ms, display_t *display)
+{
+    static bool     measuring = false;
+    static uint32_t start_ms = 0;
+
+    if (axle_hose1)
+    {
+        measuring = true;
+        start_ms = now_ms;
+        display_clear(display);
+        return;
+    }
+
+    if (!measuring)
+    {
+        if (axle_hose2)
+        {
+            set_error_led(true);
+        }
+        return;
+    }
+
+    uint32_t travel_ms = now_ms - start_ms;
+
+    if (travel_ms > SPEED_TIMEOUT_MS)
+    {
+        measuring = false;
+        set_error_led(true);
+        return;
+    }
+
+    if (axle_hose2)
+    {
+        measuring = false;
+        if (travel_ms < SPEED_MIN_TRAVEL_MS)
+        {
+            set_error_led(true);
+            return;
+        }
+        display_speed(display, (HOSE_DISTANCE_MM * TENTHS_PER_UNIT + travel_ms / 2) / travel_ms);
+        set_error_led(false);
+    }
 }
 
 static void set_segments(uint8_t pattern, bool decimal_point)
@@ -150,7 +217,7 @@ static void display_refresh(display_t *display, uint32_t now_ms)
     PORTD |= DIGIT_MASK;
 
     display->digit = (display->digit + 1) % DIGIT_COUNT;
-    uint8_t number = display->value / DIGIT_DIVISORS[display->digit] % 10;
+    uint8_t number = display->value / DIGIT_DIVISORS[display->digit] % DECIMAL_BASE;
     bool leading_zero = display->digit == 0 && number == 0;
 
     if (display->blank || leading_zero)
@@ -165,18 +232,20 @@ static void display_refresh(display_t *display, uint32_t now_ms)
 int main(void)
 {
     button_t  hose1 = { HOSE1_MASK, false, false, 0 };
+    button_t  hose2 = { HOSE2_MASK, false, false, 0 };
     display_t display = { 0, true, 0, 0 };
     uint8_t   vehicle_count = 0;
 
     init(); // arduino core, needed for millis()
     initialize_io();
-    display_speed(&display, 123); // test value until the speed measurement exists
 
     for (;;)
     {
         uint32_t now_ms = millis();
+        bool axle_hose1 = axle_detected(&hose1, now_ms);
+        bool axle_hose2 = axle_detected(&hose2, now_ms);
 
-        if (vehicle_passed(axle_detected(&hose1, now_ms), now_ms))
+        if (vehicle_passed(axle_hose1, now_ms))
         {
             vehicle_count++;
             if (vehicle_count > VEHICLE_COUNT_MAX)
@@ -184,6 +253,8 @@ int main(void)
                 vehicle_count = 0;
             }
         }
+
+        measure_speed(axle_hose1, axle_hose2, now_ms, &display);
 
         display_counter(vehicle_count);
         display_refresh(&display, now_ms);

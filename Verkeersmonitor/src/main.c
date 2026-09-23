@@ -217,13 +217,13 @@ static void display_refresh(display_t *display, uint32_t now_ms)
     PORTD |= DIGIT_MASK;
 
     display->digit = (display->digit + 1) % DIGIT_COUNT;
-    uint8_t number = display->value / DIGIT_DIVISORS[display->digit] % DECIMAL_BASE;
-    bool leading_zero = display->digit == 0 && number == 0;
 
-    if (display->blank || leading_zero)
+    if (display->blank)
     {
         return;
     }
+
+    uint8_t number = display->value / DIGIT_DIVISORS[display->digit] % DECIMAL_BASE;
 
     set_segments(DIGIT_PATTERNS[number], display->digit == UNITS_DIGIT);
     PORTD &= ~DIGIT_PINS[display->digit];
